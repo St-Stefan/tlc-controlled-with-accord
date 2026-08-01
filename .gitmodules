@@ -1,3 +1,3 @@
-[submodule "tlc-controlled"]
-	path = tlc-controlled
-	url = git@github.com:burcuku/tlc-controlled.git
+[submodule "tlc-controlled-mapper"]
+	path = tlc-controlled-mapper
+	url = git@github.com:St-Stefan/tlc-controlled-mapper.git
