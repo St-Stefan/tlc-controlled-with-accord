@@ -142,9 +142,14 @@ VARIABLES
 
     executed,           \* executed[p] = the set of executed transactions by p
 
-    relation            \* this is the < relation over transactions to check acyclicity
+    relation,           \* this is the < relation over transactions to check acyclicity
 
-vars == << bal, phase, txn, dep, ts, abal, msgs, submitted, initTimestamp, initCoord, recovered, Wvar, postWaitingFlag, recoveryAttemptBal, TXvar, Dvar, Qvar, executed, relation >>
+    \* Crash/recovery model (see the Crash and Restart actions below)
+    active              \* the set of processes that are currently up and able to take steps
+
+crashVars == << active >>
+
+vars == << bal, phase, txn, dep, ts, abal, msgs, submitted, initTimestamp, initCoord, recovered, Wvar, postWaitingFlag, recoveryAttemptBal, TXvar, Dvar, Qvar, executed, relation, active >>
 
 (***************************************************************************)
 (* Init of all the variables                                               *)
@@ -170,6 +175,7 @@ Init ==
     /\ Qvar = [p \in Proc |-> [id \in Id |-> {}]]
     /\ executed = [p \in Proc |-> {}]
     /\ relation = [id1 \in Id |-> [id2 \in Id |-> 0]]
+    /\ active = Proc
 
 
 (***************************************************************************)
@@ -194,6 +200,11 @@ MaxTsInSet(S) ==
 \* ConflictPairs is a model constant defined in ExtraConfiguration
 Conflicts(id1, id2) ==
     <<id1, id2>> \in ConflictPairs \/ <<id2, id1>> \in ConflictPairs
+
+\* A crashed process takes no steps until it is restarted. Its durable state stays
+\* visible to the invariants, which is what we want: safety has to hold over
+\* everything that was ever persisted, whether or not its owner is currently up.
+IsActive(p) == p \in active
 
 IsQuorumSized(set) == Cardinality(set) >= Cardinality(Proc) - F
 IsFastQuorumSized(set) == Cardinality(set) >= Cardinality(Proc) - E
@@ -305,6 +316,7 @@ ApplyRecover(p, b, id, tx) ==
 (* Submit (lines 4-6) *)
 
 Submit(p, id, t) ==
+    /\  IsActive(p)
     /\  id \notin submitted
     /\  LET tx == id \* We use id as command payload, since the actual payload does not matter here.
             earlierInitTimestamps == { initTimestamp[id2] : id2 \in {id1 \in Id : initCoord[id1] = p /\ LessThanTs(initTimestamp[id], initTimestamp[id1])} }
@@ -322,12 +334,13 @@ Submit(p, id, t) ==
             /\ ApplyPreAccept(p, id, tx, computations.finalTs, computations.D) \* slightly confusing here but computations.D is D0 here since this is the self addressed message.
             /\ msgs' = msgs \cup { PreAcceptMsg(p, q, id, tx, computations.D) : q \in Proc \ {p} } 
                             \cup { PreAcceptOKMsg(p, p, id, computations.finalTs, computations.D) }
-    /\ UNCHANGED <<bal, abal, recovered, Wvar, postWaitingFlag, recoveryAttemptBal, TXvar, Dvar, Qvar, executed, relation>> 
+    /\ UNCHANGED <<bal, abal, recovered, Wvar, postWaitingFlag, recoveryAttemptBal, TXvar, Dvar, Qvar, executed, relation, crashVars>> 
 
 
 (* HandlePreAccept (lines 7-14) *)
 
 HandlePreAccept(m) ==
+    /\  IsActive(m.to)
     /\  m.type = TypePreAccept
     /\  LET p  == m.to
             q  == m.from
@@ -339,13 +352,14 @@ HandlePreAccept(m) ==
         IN
         /\ ApplyPreAccept(p, id, tx, computations.finalTs, D0)
         /\ msgs' = (msgs \ {m}) \cup { PreAcceptOKMsg(p, q, id, computations.finalTs, computations.D) }
-    /\ UNCHANGED <<bal, abal, submitted, initCoord, recovered, postWaitingFlag, recoveryAttemptBal, TXvar, Dvar, Wvar, Qvar, executed, relation, initTimestamp>>
+    /\ UNCHANGED <<bal, abal, submitted, initCoord, recovered, postWaitingFlag, recoveryAttemptBal, TXvar, Dvar, Wvar, Qvar, executed, relation, initTimestamp, crashVars>>
 
 
 
 (* HandlePreAcceptOk (lines 15-23) *)
 
 HandlePreAcceptOK(p, id) ==
+    /\ IsActive(p)
     /\ bal[p][id] = 0
     /\ phase[p][id] = PreAcceptedPhase
     /\ LET  quorumOfMessages ==
@@ -375,13 +389,14 @@ HandlePreAcceptOK(p, id) ==
                     /\ ApplyAccept(p, 0, id, t, D, txn[p][id])
                     /\ msgs' = (msgs \ quorumOfMessages) \cup { AcceptMsg(p, q, 0, id, t, D, txn[p][id]) : q \in Proc \ {p} } 
                                                          \cup { AcceptOKMsg(p, p, 0, id, computations.Dq) }
-    /\ UNCHANGED <<submitted, initCoord, recovered, Wvar, postWaitingFlag, recoveryAttemptBal, TXvar, Dvar, initTimestamp, Qvar, executed, relation>>
+    /\ UNCHANGED <<submitted, initCoord, recovered, Wvar, postWaitingFlag, recoveryAttemptBal, TXvar, Dvar, initTimestamp, Qvar, executed, relation, crashVars>>
        
 
 
 (* HandleAccept (lines 24-32) *)                        
 
 HandleAccept(m) ==
+    /\ IsActive(m.to)
     /\ m.type = TypeAccept
     /\  LET p  == m.to
             q  == m.from
@@ -395,11 +410,12 @@ HandleAccept(m) ==
         IN
         /\  ApplyAccept(p, b, id, t, D, tx)
         /\  msgs' = (msgs \ {m}) \cup { AcceptOKMsg(p, q, b, id, computations.Dq) }
-    /\ UNCHANGED <<submitted, initCoord, recovered, Wvar, postWaitingFlag, recoveryAttemptBal, TXvar, Dvar, initTimestamp, Qvar, executed, relation>>
+    /\ UNCHANGED <<submitted, initCoord, recovered, Wvar, postWaitingFlag, recoveryAttemptBal, TXvar, Dvar, initTimestamp, Qvar, executed, relation, crashVars>>
 
 (* HandleAcceptOk (lines 33-35) *)
 
 HandleAcceptOK(p, id) ==
+    /\ IsActive(p)
     /\ phase[p][id] = AcceptedPhase
     /\ LET  quorumOfMessages == 
             { m \in msgs :
@@ -415,11 +431,12 @@ HandleAcceptOK(p, id) ==
             /\ ApplyCommit(p, bal[p][id], id, ts[p][id], D, txn[p][id], FALSE)
             /\ msgs' = (msgs \ quorumOfMessages) \cup { CommitMsg(p, q, bal[p][id], id, ts[p][id], D, Slow, txn[p][id]) : q \in Proc \ {p} } 
                                                  \cup { CommitOkMsg(p, p, bal[p][id], id) }
-    /\ UNCHANGED <<bal, submitted, initCoord, recovered, Wvar, postWaitingFlag, recoveryAttemptBal, TXvar, Dvar, initTimestamp, Qvar, executed, relation>>
+    /\ UNCHANGED <<bal, submitted, initCoord, recovered, Wvar, postWaitingFlag, recoveryAttemptBal, TXvar, Dvar, initTimestamp, Qvar, executed, relation, crashVars>>
 
 (* HandleCommit (lines 36-43) *)
 
 HandleCommit(m) ==
+    /\ IsActive(m.to)
     /\ m.type = TypeCommit
     /\ LET p == m.to
            q == m.from
@@ -432,7 +449,7 @@ HandleCommit(m) ==
        IN
        /\ ApplyCommit(p, b, id, t, D, tx, FALSE)
        /\ IF fastOrSlow = Slow THEN msgs' = (msgs \ {m}) \cup { CommitOkMsg(p, q, b, id) }  ELSE msgs' = msgs \ {m}
-       /\ UNCHANGED <<bal, submitted, initCoord, recovered, Wvar, postWaitingFlag, recoveryAttemptBal, TXvar, Dvar, Qvar, initTimestamp, executed, relation>>
+       /\ UNCHANGED <<bal, submitted, initCoord, recovered, Wvar, postWaitingFlag, recoveryAttemptBal, TXvar, Dvar, Qvar, initTimestamp, executed, relation, crashVars>>
 
 
 
@@ -440,6 +457,7 @@ HandleCommit(m) ==
 (* HandleCommitOk (lines 44-46) *)
 
 HandleCommitOK(p, id) ==
+    /\ IsActive(p)
     /\ phase[p][id] = CommittedPhase
     /\ LET  quorumOfMessages == 
             { m \in msgs :
@@ -452,11 +470,12 @@ HandleCommitOK(p, id) ==
         /\ IsQuorumSized(quorumOfMessages)
         /\ ApplyStable(p, bal[p][id], id)
         /\ msgs' = (msgs \ quorumOfMessages) \cup { StableMsg(p, q, bal[p][id], id) : q \in Proc \ {p} }
-    /\ UNCHANGED << bal, txn, dep, ts, abal, submitted, initCoord, recovered, Wvar, postWaitingFlag, recoveryAttemptBal, TXvar, Dvar, initTimestamp, Qvar, executed, relation >>
+    /\ UNCHANGED << bal, txn, dep, ts, abal, submitted, initCoord, recovered, Wvar, postWaitingFlag, recoveryAttemptBal, TXvar, Dvar, initTimestamp, Qvar, executed, relation, crashVars>>
 
 (* HandleStable (lines 47-49) *)
 
 HandleStable(m) ==
+    /\ IsActive(m.to)
     /\ m.type = TypeStable
     /\  LET p == m.to
             q == m.from
@@ -465,11 +484,12 @@ HandleStable(m) ==
         IN
         /\ ApplyStable(p, b, id)
         /\ msgs' = msgs \ {m}
-        /\ UNCHANGED <<bal, submitted, initCoord, dep, abal, txn, ts, recovered, Wvar, postWaitingFlag, recoveryAttemptBal, TXvar, Dvar, initTimestamp, Qvar, executed, relation>>
+        /\ UNCHANGED <<bal, submitted, initCoord, dep, abal, txn, ts, recovered, Wvar, postWaitingFlag, recoveryAttemptBal, TXvar, Dvar, initTimestamp, Qvar, executed, relation, crashVars>>
 
 (* StartRecover (lines 50-53) *)
 
 StartRecover(p, id) ==
+    /\ IsActive(p)
     /\ recovered[p][id] < NumberOfRecoveryAttempts
     /\ id \in SeenIds(p)
     /\ postWaitingFlag' = [postWaitingFlag EXCEPT ![p][id] = FALSE] 
@@ -491,12 +511,13 @@ StartRecover(p, id) ==
                     ELSE                             msgs' =  msgs \cup { RecoverOkMsg(p, p, b, id, abal[p][id], Nop, ts[p][id], D, phase[p][id], TRUE, W, WP) }        \cup { RecoverMsg(p, q, b, id, Nop)        : q \in Proc \ {p} }
             ELSE IF phase[p][id] # InitialPhase THEN msgs' =  msgs \cup { RecoverOkMsg(p, p, b, id, abal[p][id], txn[p][id], ts[p][id], D, phase[p][id], FALSE, W, WP) }\cup { RecoverMsg(p, q, b, id, txn[p][id]) : q \in Proc \ {p} }
                     ELSE                             msgs' =  msgs \cup { RecoverOkMsg(p, p, b, id, abal[p][id], Nop, ts[p][id], D, phase[p][id], FALSE, W, WP) }       \cup { RecoverMsg(p, q, b, id, Nop)        : q \in Proc \ {p} }
-    /\ UNCHANGED <<phase, dep, ts, abal, submitted, initCoord, Wvar, TXvar, Dvar, initTimestamp, Qvar, recoveryAttemptBal, executed, relation>>
+    /\ UNCHANGED <<phase, dep, ts, abal, submitted, initCoord, Wvar, TXvar, Dvar, initTimestamp, Qvar, recoveryAttemptBal, executed, relation, crashVars>>
 
 
 (* HandleRecover (lines 53-64) *)
 
 HandleRecover(m) ==
+    /\  IsActive(m.to)
     /\  m.type = TypeRecover
     /\  LET p == m.to 
             q == m.from
@@ -515,11 +536,12 @@ HandleRecover(m) ==
             /\  IF S # {}
                 THEN msgs' = (msgs \ {m})  \cup { RecoverOkMsg(p, q, b, id, abal[p][id], txn'[p][id], ts[p][id], D, phase[p][id], TRUE, W, WP) }
                 ELSE msgs' = (msgs \ {m})  \cup { RecoverOkMsg(p, q, b, id, abal[p][id], txn'[p][id], ts[p][id], D, phase[p][id], FALSE, W, WP) }
-    /\ UNCHANGED <<submitted, initCoord, dep, abal, ts, phase, recovered, TXvar, Dvar, postWaitingFlag, Wvar, recoveryAttemptBal, initTimestamp, Qvar, executed, relation>>
+    /\ UNCHANGED <<submitted, initCoord, dep, abal, ts, phase, recovered, TXvar, Dvar, postWaitingFlag, Wvar, recoveryAttemptBal, initTimestamp, Qvar, executed, relation, crashVars>>
 
 (* HandleRecoverOK (lines 65-76 + 82) *)
 
 HandleRecoverOK(p, id) ==
+    /\  IsActive(p)
     /\  LET quorumOfMessages ==
             { m \in msgs :
                 /\ m.type = TypeRecoverOK
@@ -616,11 +638,12 @@ HandleRecoverOK(p, id) ==
                         /\ msgs' = (msgs \ quorumOfMessages) \cup { AcceptMsg(p, q, bal[p][id], id, ts[p][id], dep[p][id], Nop) : q \in Proc \ {p} } 
                                                              \cup { AcceptOKMsg(p, p, bal[p][id], id, computations.Dq) } 
                         /\ UNCHANGED <<TXvar, Wvar, Dvar, recoveryAttemptBal, postWaitingFlag, Qvar>>   
-    /\ UNCHANGED <<submitted, initCoord, recovered, initTimestamp, executed, relation >>
+    /\ UNCHANGED <<submitted, initCoord, recovered, initTimestamp, executed, relation, crashVars>>
             
 (* HandlePostWaiting (lines 78-81) *)
                     
 HandlePostWaiting(p, id) ==
+    /\  IsActive(p)
     /\  recoveryAttemptBal[p][id] = bal[p][id] \* I'm not getting the ballot of corresponding recovery attempt from messages here so I use this extra variable to check ballot.
     /\  postWaitingFlag[p][id] = TRUE
     /\  LET W == Wvar[p][id]
@@ -707,7 +730,7 @@ HandlePostWaiting(p, id) ==
             /\ UNCHANGED <<msgs, postWaitingFlag, bal, dep, phase, abal, txn, ts>>
                     
         
-    /\ UNCHANGED <<submitted, initCoord, recovered, Wvar, recoveryAttemptBal, TXvar, Dvar, initTimestamp, Qvar, executed, relation>>
+    /\ UNCHANGED <<submitted, initCoord, recovered, Wvar, recoveryAttemptBal, TXvar, Dvar, initTimestamp, Qvar, executed, relation, crashVars>>
 
 
 (***************************************************************************)
@@ -715,6 +738,7 @@ HandlePostWaiting(p, id) ==
 (***************************************************************************)  
 
 Execute(p, id) ==
+    /\ IsActive(p)
     /\ id \notin executed[p]
     /\ phase[p][id] = StablePhase
     /\ \A id2 \in dep[p][id] :
@@ -730,7 +754,54 @@ Execute(p, id) ==
                 ELSE relation[id1][id2]
                 ]
             ]
-    /\ UNCHANGED <<bal, phase, txn, dep, ts, abal, msgs, submitted, initTimestamp, initCoord, recovered, Wvar, postWaitingFlag, recoveryAttemptBal, TXvar, Dvar, Qvar>>
+    /\ UNCHANGED <<bal, phase, txn, dep, ts, abal, msgs, submitted, initTimestamp, initCoord, recovered, Wvar, postWaitingFlag, recoveryAttemptBal, TXvar, Dvar, Qvar, crashVars>>
+
+(***************************************************************************)
+(* Crashes and restarts                                                    *)
+(***************************************************************************)
+
+\* A crash takes a process out of the active set, so it stops handling messages
+\* and stops initiating steps, and wipes the state that a real replica keeps only
+\* in memory. Everything the command store persists before it replies to a
+\* message survives the crash:
+\*
+\*   durable  : bal, abal, phase, txn, ts, dep        (the per-command record)
+\*              executed                              (the applied result)
+\*   volatile : Wvar, TXvar, Dvar, Qvar,              (in-flight recovery state
+\*              postWaitingFlag, recoveryAttemptBal    of a recovery coordinator)
+\*
+\* Losing the volatile half means a recovery coordinator that crashes mid-recovery
+\* simply abandons it, and some other process has to run recovery again - which is
+\* exactly the behaviour we want to exercise against the implementation.
+\*
+\* recovered is deliberately *not* reset: it is a model checking bound, not
+\* replica state, and resetting it would let a process recover a command
+\* NumberOfRecoveryAttempts times per crash. There is no cap on the number of
+\* crashes themselves: active is already a subset of the finite set Proc, so
+\* crashing and restarting a process over and over never grows the state space.
+Crash(p) ==
+    /\ IsActive(p)
+    \* Accord's safety proof assumes at most F processes are down at once; past
+    \* that point Agreement/Ordering aren't claimed to hold, so we don't let the
+    \* model (or a driving trace) step into a state where that's violated.
+    /\ Cardinality(active) > N - F
+    /\ active' = active \ {p}
+    /\ Wvar' = [Wvar EXCEPT ![p] = [id \in Id |-> {}]]
+    /\ TXvar' = [TXvar EXCEPT ![p] = [id \in Id |-> Bottom]]
+    /\ Dvar' = [Dvar EXCEPT ![p] = [id \in Id |-> {}]]
+    /\ Qvar' = [Qvar EXCEPT ![p] = [id \in Id |-> {}]]
+    /\ postWaitingFlag' = [postWaitingFlag EXCEPT ![p] = [id \in Id |-> FALSE]]
+    /\ recoveryAttemptBal' = [recoveryAttemptBal EXCEPT ![p] = [id \in Id |-> 0]]
+    /\ UNCHANGED << bal, phase, txn, dep, ts, abal, msgs, submitted, initTimestamp, initCoord, recovered, executed, relation >>
+
+\* The process comes back up and resumes from its durable state. Messages that
+\* were sent to it while it was down are still in msgs, so it may now handle
+\* them, and messages it sent before crashing are still in flight too.
+Restart(p) ==
+    /\ ~IsActive(p)
+    /\ active' = active \cup {p}
+    /\ UNCHANGED << bal, phase, txn, dep, ts, abal, msgs, submitted, initTimestamp, initCoord, recovered, Wvar, postWaitingFlag, recoveryAttemptBal, TXvar, Dvar, Qvar, executed, relation >>
+
 
 (***************************************************************************)
 (* Invariants                                                              *)
@@ -822,6 +893,10 @@ Next ==
         \/ HandleRecoverWrapper(p, id)
 
         \/ Execute(p, id) 
+
+    \/ \E p \in Proc :
+        \/ Crash(p)
+        \/ Restart(p)
 
 
 Spec ==
